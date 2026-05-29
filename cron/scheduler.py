@@ -734,18 +734,55 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     """
     from hermes_constants import get_hermes_home
 
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
+    # Primary scripts dir: ~/.hermes/cron/scripts/ — this subtree is synced
+    # to S3 via workspace_sync.restore_subtree(NAMESPACE, "cron") on every
+    # AgentCore invoke, so scripts written here survive across microVM
+    # invocations (Firecracker resets the local FS between calls).
+    #
+    # Fallback: ~/.hermes/scripts/ — legacy location kept for backward
+    # compatibility with scripts created before this fix.
+    hermes_home = _get_hermes_home()
+    cron_scripts_dir = hermes_home / "cron" / "scripts"
+    legacy_scripts_dir = hermes_home / "scripts"
+    cron_scripts_dir.mkdir(parents=True, exist_ok=True)
 
     raw = Path(script_path).expanduser()
     if raw.is_absolute():
         path = raw.resolve()
+        # For absolute paths, determine which scripts dir to validate against
+        cron_scripts_resolved = cron_scripts_dir.resolve()
+        legacy_scripts_resolved = legacy_scripts_dir.resolve()
+        try:
+            path.relative_to(cron_scripts_resolved)
+            scripts_dir_resolved = cron_scripts_resolved
+        except ValueError:
+            try:
+                path.relative_to(legacy_scripts_resolved)
+                scripts_dir_resolved = legacy_scripts_resolved
+            except ValueError:
+                return False, (
+                    f"Blocked: script path resolves outside the allowed scripts directories "
+                    f"({cron_scripts_resolved} or {legacy_scripts_resolved}): {script_path!r}"
+                )
     else:
-        path = (scripts_dir / raw).resolve()
+        # Relative path: prefer cron/scripts/, fall back to legacy scripts/
+        # if the file already exists there (backward compat for old jobs).
+        cron_path = (cron_scripts_dir / raw).resolve()
+        legacy_path = (legacy_scripts_dir / raw).resolve()
+        cron_scripts_resolved = cron_scripts_dir.resolve()
+        legacy_scripts_resolved = legacy_scripts_dir.resolve()
+
+        # Use legacy path only if it exists and cron path does not — this
+        # covers jobs created before the scripts-dir migration.
+        if not cron_path.exists() and legacy_path.exists():
+            path = legacy_path
+            scripts_dir_resolved = legacy_scripts_resolved
+        else:
+            path = cron_path
+            scripts_dir_resolved = cron_scripts_resolved
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
+    # escape — scripts MUST reside within one of the two allowed dirs.
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
