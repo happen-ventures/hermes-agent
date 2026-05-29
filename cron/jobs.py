@@ -400,6 +400,16 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
+    # HV: when HERMES_MEMORY_TABLE is set, DynamoDB is the source of truth (kills the
+    # jobs.json S3-sync race, #71). Delegating here — inside the module the cron tool
+    # actually imports — reaches every execution context (the agent runs the cron tool
+    # in a separate process where a parent-side monkey-patch wouldn't apply).
+    if os.environ.get("HERMES_MEMORY_TABLE"):
+        try:
+            import dynamo_cron
+            return dynamo_cron._dd_load_jobs()
+        except Exception as e:  # noqa: BLE001 — fall back to jobs.json on any error
+            logger.error("dynamo_cron load failed, falling back to jobs.json: %s", e)
     ensure_dirs()
     if not JOBS_FILE.exists():
         return []
@@ -429,6 +439,14 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
+    # HV: DynamoDB is the source of truth when configured (see load_jobs).
+    if os.environ.get("HERMES_MEMORY_TABLE"):
+        try:
+            import dynamo_cron
+            dynamo_cron._dd_save_jobs(jobs)
+            return
+        except Exception as e:  # noqa: BLE001 — fall back to jobs.json on any error
+            logger.error("dynamo_cron save failed, falling back to jobs.json: %s", e)
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
